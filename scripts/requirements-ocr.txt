@@ -1,0 +1,6 @@
+easyocr>=1.7.1
+numpy>=1.24
+Pillow>=10.0
+pytesseract>=0.3.10
+# Also install the Tesseract engine (Windows):
+#   winget install --id UB-Mannheim.TesseractOCR

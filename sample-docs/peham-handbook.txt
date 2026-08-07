@@ -1,0 +1,23 @@
+# Peham Internship — Quick Handbook (sample)
+
+## What this internship is for
+The Peham AI Developer Internship teaches you to build real AI products — not only chat in a browser.
+You learn to call LLMs from code, ground answers in private documents (RAG), use tools carefully, automate workflows (n8n), and ship a capstone for Peham (Ask Peham's Docs).
+Goal: leave able to explain and demo a working internal AI tool on your CV.
+
+## Office hours
+Mentor office hours: Tuesday and Thursday, 3:00–5:00 PM (PKT), online via Meet.
+
+## How we work
+- One exercise at a time unless told otherwise
+- Keep API keys in `.env` / `.env.local` — never commit secrets
+- Daily notes go in `internship-logbook/`
+
+## Stack (target)
+Next.js, TypeScript, Supabase (pgvector), Groq, Docker/Coolify for deploy
+
+## Ask Peham's Docs
+Upload this file (or real Peham PDFs) into Vertex, then ask questions like:
+- "What is the internship for?"
+- "When are office hours?"
+- "Where do I put API keys?"

@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+.gitignore
+.env*
+!.env.example
+*.log
+.DS_Store
+tsconfig.tsbuildinfo
+next-env.d.ts
+scripts/remove-logo-bg.js

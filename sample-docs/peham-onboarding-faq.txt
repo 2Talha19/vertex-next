@@ -1,0 +1,13 @@
+# Peham — Onboarding FAQ (sample)
+
+Q: What is the internship for?
+A: To train AI developers who can ship internal tools: APIs, RAG over company docs, light agents/tools, and a deployed capstone useful to Peham.
+
+Q: What is the capstone?
+A: Weeks 4–5: ship one internal tool (Ask Peham's Docs). Must include RAG, a tool or structured step, auth (later), and deploy.
+
+Q: What is RAG?
+A: Retrieval-Augmented Generation — search your documents, then let the LLM answer using those chunks, with citations. The user gets a normal answer; similarity search only happens behind the scenes.
+
+Q: Support vs Docs?
+A: Docs = ask company knowledge. Support triage = classify tickets + human approve (optional second project).
