@@ -2,7 +2,7 @@
  * Functional + security test pass for Vertex (run against a live dev server).
  * Covers auth, refresh, chat, upload, ownership, and cross-user isolation.
  */
-const BASE = "http://localhost:3000";
+const BASE = process.env.BASE_URL || "http://localhost:3000";
 
 let pass = 0;
 let fail = 0;
