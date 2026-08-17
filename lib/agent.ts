@@ -64,6 +64,46 @@ type CitationRow = {
   content: string;
 };
 
+/**
+ * Call the model with automatic retry on transient failures.
+ * - 429 (rate limit / TPM exceeded): waits ~2s then retries, up to `attempts`
+ *   total, honoring a Retry-After header when the API sends one. Long chats
+ *   hit Groq's free-tier TPM cap often; this makes them invisible to the user.
+ * - 5xx / network blips: also retried (brief, usually self-healing).
+ * - 4xx auth/validation errors are NOT retried — they'd never succeed.
+ */
+async function chatWithRetry(
+  client: OpenAI,
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming,
+  attempts = 3
+) {
+  let lastErr: unknown;
+  let delayMs = 2000;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await client.chat.completions.create(params);
+    } catch (err) {
+      lastErr = err;
+      const e = err as { status?: number; headers?: Headers; message?: string };
+      const status = e.status ?? 0;
+      const retryable =
+        status === 429 ||
+        status >= 500 ||
+        !status ||
+        /rate limit|too many requests|temporarily unavailable|ECONNRESET|ETIMEDOUT|socket hang up/i.test(
+          e.message || ""
+        );
+      if (!retryable || attempt === attempts) break;
+
+      // Honor Retry-After if Groq sent one; otherwise exponential backoff.
+      const retryAfter = Number(e.headers?.get?.("retry-after") ?? 0);
+      const wait = retryAfter > 0 ? retryAfter * 1000 : delayMs * attempt;
+      await new Promise((r) => setTimeout(r, Math.min(wait, 15000)));
+    }
+  }
+  throw lastErr;
+}
+
 async function* streamAnswer(
   client: OpenAI,
   model: string,
@@ -79,7 +119,7 @@ async function* streamAnswer(
   // city as JSON, fetch the weather, then ask it to answer.
   if (useWeatherTool) {
     const userMessages = messages.filter((m) => m.role !== "system");
-    const extract = await client.chat.completions.create({
+    const extract = await chatWithRetry(client, {
       model,
       messages: [
         {
@@ -118,7 +158,7 @@ async function* streamAnswer(
       weather = JSON.stringify({ error: (e as Error).message });
     }
 
-    const final = await client.chat.completions.create({
+    const final = await chatWithRetry(client, {
       model,
       messages: [
         {
@@ -151,7 +191,7 @@ async function* streamAnswer(
   for (let round = 1; round <= 4; round++) {
     let msg;
     try {
-      const res = await client.chat.completions.create({
+      const res = await chatWithRetry(client, {
         model,
         messages: working,
         // Cap output so answers stay short and cheap.
