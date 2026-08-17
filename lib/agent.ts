@@ -1,21 +1,18 @@
 /**
  * Vertex agent for Ask Peham's Docs.
  * - Docs search is done in code (no fragile tool-calls for search)
- * - Weather still uses a tool when needed
+ * - Weather extracts the city as JSON, then answers (the models available on
+ *   this Groq key don't support native function-calling tools)
  * - Chat history supports follow-ups like "and private notes?"
  */
 import OpenAI from "openai";
-import type {
-  ChatCompletionMessageParam,
-  ChatCompletionTool,
-} from "openai/resources/chat/completions";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   expandSearchQuery,
   isBroadDocQuestion,
   isImageSource,
   wantsFullFileRead,
 } from "./doc-intent";
-import { getFailedGeneration, parseGroqFailedTool } from "./groq-tools";
 import {
   loadSourceChunks,
   retrieveChunks,
@@ -42,23 +39,6 @@ export type AgentEvent =
   | { type: "error"; text: string };
 
 export type ChatTurn = { role: "user" | "bot"; text: string };
-
-const weatherTool: ChatCompletionTool[] = [
-  {
-    type: "function",
-    function: {
-      name: "get_weather",
-      description: "Get current weather for a city.",
-      parameters: {
-        type: "object",
-        properties: {
-          city: { type: "string", description: "City name" },
-        },
-        required: ["city"],
-      },
-    },
-  },
-];
 
 function toCitations(matches: Match[], limit = 6) {
   return matches.slice(0, limit).map((m, i) => ({
@@ -93,63 +73,98 @@ async function* streamAnswer(
 ): AsyncGenerator<AgentEvent> {
   yield { type: "status", text: "Thinking…" };
 
-  let recoveryCount = 0;
-  const working = [...messages];
+  // ===== WEATHER AGENT =====
+  // The models available on this Groq key don't support native function
+  // calls, so weather works in two plain-chat steps: ask the model for the
+  // city as JSON, fetch the weather, then ask it to answer.
+  if (useWeatherTool) {
+    const userMessages = messages.filter((m) => m.role !== "system");
+    const extract = await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract the city the user is asking about the weather for. Reply with ONLY a JSON object in this exact form: {\"city\": \"CityName\"}. No other text.",
+        },
+        ...userMessages,
+      ],
+      max_tokens: 60,
+    });
+    const raw = extract.choices[0]?.message?.content?.trim() ?? "";
+    let city: string | null = null;
+    try {
+      const json = raw.match(/\{[\s\S]*\}/)?.[0] ?? "{}";
+      city = (JSON.parse(json) as { city?: string })?.city ?? null;
+    } catch {
+      city = null;
+    }
 
+    if (!city) {
+      // The model answered directly instead of returning JSON — stream it.
+      for (const w of raw.split(/(\s+)/)) {
+        if (w) yield { type: "token", text: w };
+      }
+      yield { type: "done", citations: [] };
+      return;
+    }
+
+    yield { type: "tool", name: "get_weather", args: JSON.stringify({ city }) };
+    yield { type: "status", text: "Checking weather…" };
+    let weather = "";
+    try {
+      weather = await getWeather(city);
+    } catch (e) {
+      weather = JSON.stringify({ error: (e as Error).message });
+    }
+
+    const final = await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are Vertex Weather agent. Answer the user's question about the weather in plain, friendly language, in 1-3 short sentences.",
+        },
+        ...userMessages,
+        {
+          role: "assistant",
+          content: `The current weather in ${city} is: ${weather}`,
+        },
+        {
+          role: "user",
+          content: "Now answer my weather question based on that data.",
+        },
+      ],
+      max_tokens: 400,
+    });
+    const answer = final.choices[0]?.message?.content?.trim() ?? "";
+    for (const w of answer.split(/(\s+)/)) {
+      if (w) yield { type: "token", text: w };
+    }
+    yield { type: "done", citations: [] };
+    return;
+  }
+
+  // ===== DOCS / CHAT AGENT — plain chat, citations are added by the caller =====
+  const working = [...messages];
   for (let round = 1; round <= 4; round++) {
     let msg;
     try {
       const res = await client.chat.completions.create({
         model,
         messages: working,
-        ...(useWeatherTool
-          ? {
-              tools: weatherTool,
-              tool_choice: "auto" as const,
-              parallel_tool_calls: false,
-            }
-          : {}),
+        // Cap output so answers stay short and cheap.
+        // 400 tokens ≈ 280–320 words — enough for a full, cited answer.
+        max_tokens: 400,
       });
       msg = res.choices[0]?.message;
     } catch (err) {
-      const failed = getFailedGeneration(err);
-      const parsed = failed ? parseGroqFailedTool(failed) : null;
-      if (!parsed || parsed.name !== "get_weather") {
-        yield {
-          type: "error",
-          text:
-            (err as Error).message?.includes("Failed to call a function")
-              ? "I hit a temporary tool error. Try asking again in a full sentence (e.g. “What are private notes in the internship docs?”)."
-              : (err as Error).message || "Model request failed",
-        };
-        return;
-      }
-      recoveryCount += 1;
-      const callId = `call_recovery_${recoveryCount}`;
-      yield { type: "tool", name: "get_weather", args: parsed.args };
-      working.push({
-        role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            id: callId,
-            type: "function",
-            function: { name: "get_weather", arguments: parsed.args },
-          },
-        ],
-      });
-      try {
-        const args = JSON.parse(parsed.args) as { city: string };
-        const result = await getWeather(args.city);
-        working.push({ role: "tool", tool_call_id: callId, content: result });
-      } catch (e) {
-        working.push({
-          role: "tool",
-          tool_call_id: callId,
-          content: JSON.stringify({ error: (e as Error).message }),
-        });
-      }
-      continue;
+      yield {
+        type: "error",
+        text: (err as Error).message || "Model request failed",
+      };
+      return;
     }
 
     if (!msg) {
@@ -158,72 +173,46 @@ async function* streamAnswer(
     }
 
     working.push(msg);
-    const toolCalls = msg.tool_calls;
-
-    if (!toolCalls?.length) {
-      const text = msg.content?.trim() ?? "";
-      for (const w of text.split(/(\s+)/)) {
-        if (w) yield { type: "token", text: w };
-      }
-      // Guarantee clickable citations even if the model skipped inline
-      // markers — the UI turns [1] / [2] into buttons.
-      const hasMarker = /\[(Source\s*)?\d+[^\]]*\]/i.test(text);
-      if (citationRows.length > 0 && !hasMarker) {
-        yield { type: "token", text: "\n\n**Sources:** " };
-        yield {
-          type: "token",
-          text: citationRows
-            .map((c, i) => `[${i + 1}] ${c.source}`)
-            .join(" · "),
-        };
-      }
-      yield { type: "done", citations: citationRows };
-      return;
+    const text = msg.content?.trim() ?? "";
+    for (const w of text.split(/(\s+)/)) {
+      if (w) yield { type: "token", text: w };
     }
-
-    for (const call of toolCalls) {
-      if (call.function.name !== "get_weather") {
-        working.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: JSON.stringify({
-            error: "Only get_weather is available. Answer without other tools.",
-          }),
-        });
-        continue;
-      }
+    // Guarantee clickable citations even if the model skipped inline
+    // markers — the UI turns [1] / [2] into buttons.
+    const hasMarker = /\[(Source\s*)?\d+[^\]]*\]/i.test(text);
+    if (citationRows.length > 0 && !hasMarker) {
+      yield { type: "token", text: "\n\n**Sources:** " };
       yield {
-        type: "tool",
-        name: "get_weather",
-        args: call.function.arguments,
+        type: "token",
+        text: citationRows
+          .map((c, i) => `[${i + 1}] ${c.source}`)
+          .join(" · "),
       };
-      yield { type: "status", text: "Checking weather…" };
-      try {
-        const args = JSON.parse(call.function.arguments) as { city: string };
-        const result = await getWeather(args.city);
-        working.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: result,
-        });
-      } catch (e) {
-        working.push({
-          role: "tool",
-          tool_call_id: call.id,
-          content: JSON.stringify({ error: (e as Error).message }),
-        });
-      }
     }
+    yield { type: "done", citations: citationRows };
+    return;
   }
 
-  yield { type: "error", text: "Too many tool rounds" };
+  yield { type: "error", text: "Too many rounds" };
 }
+
+const STYLE_INSTRUCTIONS: Record<string, string> = {
+  concise:
+    "Be concise: keep answers short and skip filler. Use bullets only when they genuinely save space.",
+  friendly:
+    "Be warm and friendly: keep a light, approachable tone while staying professional and accurate.",
+  technical:
+    "Be precise and technical: use exact terminology and include specifics (numbers, units, file names, code) where relevant. Prefer thoroughness over brevity.",
+};
 
 export async function* runVertexAgent(opts: {
   message: string;
+  userId: string;
   filterSource?: string | null;
   availableSources?: string[];
   history?: ChatTurn[];
+  style?: string;
+  hasDocs?: boolean;
 }): AsyncGenerator<AgentEvent> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
@@ -246,6 +235,7 @@ export async function* runVertexAgent(opts: {
   const decision = routeMessage(opts.message, {
     availableSources: available,
     preferredSource: opts.filterSource ?? null,
+    hasDocs: opts.hasDocs,
   });
 
   yield {
@@ -257,7 +247,9 @@ export async function* runVertexAgent(opts: {
     apiKey,
     baseURL: "https://api.groq.com/openai/v1",
   });
-  const MODEL = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
+  // groq/compound-mini is fast, cheap and always available on Groq —
+  // llama-3.1-8b-instant was removed from Groq and now 404s.
+  const MODEL = process.env.GROQ_MODEL || "groq/compound-mini";
 
   let citationRows: ReturnType<typeof toCitations> = [];
   let systemContent = "";
@@ -317,15 +309,24 @@ Use get_weather for the city the user asks about, then answer briefly in plain l
     try {
       let matches: Match[] = [];
       if (forceFull && searchSource) {
-        matches = await loadSourceChunks(searchSource, 50);
+        matches = await loadSourceChunks(opts.userId, searchSource, 30);
       } else {
-        matches = await retrieveChunks(searchQuery, 8, searchSource);
+        matches = await retrieveChunks(
+          opts.userId,
+          searchQuery,
+          8,
+          searchSource
+        );
         if (searchSource && matches.length < 2) {
-          const fallback = await loadSourceChunks(searchSource, 30);
+          const fallback = await loadSourceChunks(
+            opts.userId,
+            searchSource,
+            30
+          );
           if (fallback.length) matches = fallback;
         }
         if (!searchSource && matches.length < 2) {
-          matches = await retrieveChunks(searchQuery, 8, null);
+          matches = await retrieveChunks(opts.userId, searchQuery, 8, null);
         }
       }
 
@@ -348,25 +349,29 @@ Use get_weather for the city the user asks about, then answer briefly in plain l
 ${docsList}
 
 CRITICAL:
-- Document context below IS the file content (images already OCR'd to text).
-- NEVER say you cannot read images/PDFs/files.
-- Quote or explain clearly. Translate Roman Urdu/Hindi to simple English if helpful.
-- Use ONLY the document context. If empty, say so.
-- Do not mention routing, OCR, embeddings, or tools unless asked.
-- If context looks garbled, say OCR struggled on a dense diagram and suggest a clearer crop or .txt.
+- The context below IS the file content (images already OCR'd to text).
+- Never say you can't read images/PDFs/files. If garbled, say OCR struggled on a dense diagram and suggest a clearer crop or .txt.
+- Quote or explain clearly; translate Roman Urdu/Hindi to simple English when helpful.
+- Use ONLY this context; if empty, say so.
+- Never mention routing, OCR, embeddings, or tools unless asked.
 
 CITATIONS:
-- Each context block is labeled [Source N | filename] in the Document context below.
-- Cite as you go: after every sentence that uses a source, add a marker [N] where N is that source's number (Source 1 → [1]).
-- Put the marker right after the sentence, before the closing period. Never cite sources you did not use.
-- Answer with several short paragraphs and bullet lists; keep citations inline so the reader can jump to the exact chunk.
+- Context blocks are labeled [Source N | filename].
+- Cite as you go: after each sentence using a source, add [N] (Source 1 → [1]) right before the closing period. Never cite unused sources.
+- Answer in several short paragraphs and bullet lists, with citations inline so readers can jump to the exact chunk.
+
+KEEP IT SHORT:
+- Answer in 1–3 short paragraphs or a few bullets. Do not repeat the question.
+- No intro/outro filler like "Based on the documents" or "Let me know if...".
 
 Document context:
 ${docContext}`;
     } else {
-      systemContent = `You are Vertex Docs agent.
+      systemContent = `You are Vertex assistant.
 ${docsList}
-No matching document text was found. Say briefly you could not find it and suggest uploading a file or naming one from this chat.
+The user's documents were searched but nothing relevant matched.
+- If the question is general knowledge (not about their files), answer it helpfully and briefly from what you know.
+- If it IS about their documents/policy, say briefly you could not find it in their uploads and suggest uploading a file or naming one from this chat.
 Do not invent searchable topic menus. Do not say you cannot read images.`;
     }
   }
@@ -374,16 +379,25 @@ Do not invent searchable topic menus. Do not say you cannot read images.`;
   // ========== GENERAL CHAT AGENT — no forced retrieval ==========
   else {
     systemContent = `You are Vertex Chat agent for Ask Peham's Docs.
-Answer helpfully in plain language for general questions.
+Answer helpfully in plain language for general questions. Be concise — 1–3 short sentences unless the question needs detail.
 Do NOT invent Peham policy. If they need company/doc answers, ask them to upload a file or say which doc.
 Do not mention agents, routing, or tools.`;
+  }
+
+  // User-chosen response style (from settings) is appended to every agent's
+  // system prompt so the whole conversation follows it.
+  const style = opts.style?.trim() || "default";
+  if (style !== "default") {
+    systemContent += `\n\nResponse style:\n${STYLE_INSTRUCTIONS[style as keyof typeof STYLE_INSTRUCTIONS] || ""}`;
   }
 
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: systemContent },
   ];
 
-  for (const turn of history.slice(-6)) {
+  // Only the last 4 turns, trimmed per turn — enough context for follow-ups
+  // ("and private notes?") without paying to re-send entire old answers.
+  for (const turn of history.slice(-4)) {
     const text = turn.text.trim();
     if (!text) continue;
     if (
@@ -396,7 +410,7 @@ Do not mention agents, routing, or tools.`;
     }
     messages.push({
       role: turn.role === "user" ? "user" : "assistant",
-      content: text.slice(0, 1500),
+      content: text.slice(0, 600),
     });
   }
   messages.push({ role: "user", content: opts.message });

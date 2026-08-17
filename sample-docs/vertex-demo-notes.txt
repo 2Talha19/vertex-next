@@ -1,0 +1,21 @@
+Vertex Project Notes
+
+Vertex is a document-aware AI assistant built for the PEHAM internship capstone.
+
+The tech stack uses Next.js for the web app, Supabase for authentication and storage, and pgvector for vector search.
+
+Embeddings are generated with Jina AI's jina-embeddings-v3 model.
+
+The language model runs on Groq for fast streaming responses.
+
+Documents are split into 500-character chunks with 50 characters of overlap before embedding.
+
+Answers are grounded in the uploaded documents and every answer shows clickable citations that jump to the exact source chunk.
+
+Images are read with an OCR pipeline that starts with Gemini 2.5 Flash and falls back to Groq's vision model.
+
+Live weather data comes from the Open-Meteo API through a built-in tool call.
+
+The chat keeps per-user conversation history in the sidebar, so you can switch back to any earlier chat.
+
+The whole project is deployed on Vercel from a GitHub repository.

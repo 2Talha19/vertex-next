@@ -37,7 +37,11 @@ function LinkHandlerInner() {
         // Same session shape the main app expects (Home reads it on mount).
         localStorage.setItem(
           "vertex-user",
-          JSON.stringify({ email: data.user.email, name: data.user.name })
+          JSON.stringify({
+            email: data.user.email,
+            name: data.user.name,
+            token: data.token,
+          })
         );
         window.location.href = "/";
       } catch (err) {

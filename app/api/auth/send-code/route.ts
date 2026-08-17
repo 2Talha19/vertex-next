@@ -3,7 +3,7 @@
  * Body: { email, name? }
  */
 import { NextResponse } from "next/server";
-import { sendOtpCode } from "@/lib/auth";
+import { sendOtpCode, resolveAppUrl } from "@/lib/auth";
 
 export const runtime = "nodejs";
 
@@ -19,9 +19,17 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Enter a valid email address." }, { status: 400 });
   }
 
-  const result = await sendOtpCode(email, name);
+  const result = await sendOtpCode(email, name, resolveAppUrl(req));
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: 400 });
   }
-  return NextResponse.json({ ok: true, email, codeLength: result.codeLength });
+  return NextResponse.json({
+    ok: true,
+    email,
+    codeLength: result.codeLength,
+    // Demo mode only: the code is returned instead of emailed.
+    ...("demoCode" in result && result.demoCode
+      ? { demoCode: result.demoCode }
+      : {}),
+  });
 }

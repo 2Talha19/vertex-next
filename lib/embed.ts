@@ -40,13 +40,6 @@ async function embedMany(
     .map((d) => d.embedding);
 }
 
-// Use at upload time — embeds the stored document chunks.
-export async function embedTexts(texts: string[]): Promise<number[][]> {
-  const vecs = await embedMany(texts, "retrieval.passage");
-  if (vecs.length === 0) throw new Error("Jina returned no embeddings");
-  return vecs;
-}
-
 /** Embed in small batches so the UI can show live progress. */
 export async function embedTextsBatched(
   texts: string[],

@@ -1,13 +1,21 @@
 /**
  * POST /api/upload — stream progress as NDJSON while OCR → chunk → embed → save.
+ * Requires a valid Supabase session token (Authorization: Bearer <token>).
+ * Every file is stored in the authenticated user's own storage bucket and its
+ * chunks are scoped in the documents table with a `u_<userId>__` source prefix,
+ * so no user ever sees another user's uploads.
  */
 import { chunkText } from "@/lib/chunk";
 import { embedTextsBatched } from "@/lib/embed";
 import { extractTextFromFile } from "@/lib/extract-text";
+import { requireUser } from "@/lib/auth";
+import { scopedSource } from "@/lib/retrieve";
 import { getSupabase } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
+
+const MAX_BYTES = 25 * 1024 * 1024; // 25 MB — keep server memory bounded
 
 type ProgressEvent =
   | { type: "status"; text: string }
@@ -16,8 +24,20 @@ type ProgressEvent =
 
 export async function POST(req: Request) {
   const encoder = new TextEncoder();
-  const form = await req.formData();
-  const file = form.get("file");
+
+  const user = await requireUser(req);
+  if (!user) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let file: File | null = null;
+  try {
+    const form = await req.formData();
+    const f = form.get("file");
+    if (f instanceof File) file = f;
+  } catch {
+    file = null; // malformed/empty body — handled as "no file" below
+  }
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -44,10 +64,32 @@ export async function POST(req: Request) {
           return;
         }
 
+        // Server-side size + type enforcement (the UI also checks, but the API
+        // must never trust the client).
+        if (file.size > MAX_BYTES) {
+          send({
+            type: "error",
+            text: `File is too large — max 25 MB (this one is ${Math.round(
+              file.size / 1024 / 1024
+            )} MB).`,
+          });
+          return;
+        }
+
         const name = (file.name || "").toLowerCase();
         const isImage =
           /\.(png|jpe?g|webp|gif|jfif)$/i.test(name) ||
           (file.type || "").startsWith("image/");
+        const isPdf = name.endsWith(".pdf") || file.type === "application/pdf";
+        const isText =
+          /\.(txt|md)$/i.test(name) || (file.type || "").startsWith("text/");
+        if (!isImage && !isPdf && !isText) {
+          send({
+            type: "error",
+            text: "Unsupported file type — upload images, PDFs, or .txt/.md files.",
+          });
+          return;
+        }
 
         send({ type: "status", text: "Reading file…" });
         if (isImage) {
@@ -64,7 +106,7 @@ export async function POST(req: Request) {
         }
 
         const text = await extractTextFromFile(file);
-        const source = file.name || "upload.txt";
+        const source = scopedSource(user.id, file.name || "upload.txt");
         send({
           type: "status",
           text: `Got ${text.length.toLocaleString()} characters of text`,
@@ -94,6 +136,39 @@ export async function POST(req: Request) {
 
         send({ type: "status", text: "Saving to Supabase…" });
 
+        const supabase = getSupabase();
+
+        // 1) Store the raw file in THIS user's own storage bucket (created on
+        //    demand, never shared with other users).
+        const bucket = `vertex-${user.id}`;
+        try {
+          const { data: buckets } = await supabase.storage.listBuckets();
+          if (!buckets?.some((b) => b.id === bucket)) {
+            await supabase.storage.createBucket(bucket, { public: false });
+          }
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          const { error: upErr } = await supabase.storage
+            .from(bucket)
+            .upload(source, bytes, {
+              contentType: file.type || "application/octet-stream",
+              upsert: true,
+            });
+          if (!upErr) {
+            send({
+              type: "status",
+              text: "Saved original to your private bucket",
+            });
+          }
+        } catch (e) {
+          console.error("Bucket upload failed (continuing):", e);
+          send({
+            type: "status",
+            text: "Note: original file archive skipped — chunks saved anyway",
+          });
+        }
+
+        // 2) Index the chunks, scoped to this user (delete only their old rows
+        //    for the same source).
         const rows = chunks.map((content, chunk_index) => ({
           source,
           chunk_index,
@@ -101,7 +176,6 @@ export async function POST(req: Request) {
           embedding: embeddings[chunk_index],
         }));
 
-        const supabase = getSupabase();
         await supabase.from("documents").delete().eq("source", source);
         const { error } = await supabase.from("documents").insert(rows);
         if (error) {

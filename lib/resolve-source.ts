@@ -49,7 +49,3 @@ export function resolveDocSource(
 
   return latest;
 }
-
-export function isWeatherQuestion(message: string): boolean {
-  return /\b(weather|temperature|forecast|humid|°c|°f)\b/i.test(message);
-}

@@ -46,20 +46,31 @@ Supabase needs Week 2 `documents` + `match_documents`, plus Auth (email provider
 - The emailed confirmation **link** lands on `/auth/confirm` (alias `/auth/callback`), which consumes the token and logs you in — no more "site can't be reached".
 
 ### Why the emailed link used to fail (and the fix)
-Supabase emails a confirmation link pointing at the project's configured **Site URL** (default `http://localhost:3000`). The app now **runs on port 3000** (`npm run dev`) and serves the `/auth/confirm` handler, so the link works. When you deploy, set **Supabase → Authentication → URL Configuration → Site URL / Redirect URLs** to your real domain (e.g. `https://your-app.com` and `https://your-app.com/auth/confirm`).
+Supabase emails a confirmation link pointing at the project's configured **Site URL** (default `http://localhost:3000`). The app serves the `/auth/confirm` handler (alias `/auth/callback`), so the link works as long as the app is reachable at that URL. Two safeguards:
 
-### Email sending: add a free Resend key (recommended)
-The Supabase built-in email provider is capped at **~2 emails/hour**. Add one key to lift it:
+1. **Run on the port Supabase expects** — `npm run dev` serves on port 3000, matching the default Site URL.
+2. **Any port / any host** — the app now auto-detects the URL you're actually on (from the request, or `AUTH_REDIRECT_URL` in `.env.local`) and passes it to Supabase as `redirectTo`, so the emailed link points at the running app even on a different port. The URL must be in **Supabase → Authentication → URL Configuration → Redirect URLs**; add `http://localhost:**/**` (wildcard) to allow any localhost port. If a URL isn't allowlisted, the code is still emailed — only the link falls back to the Site URL.
 
-1. Create a free account at **https://resend.com** (any email works)
-2. Sidebar → **API Keys** → **Create API Key** → copy it
-3. Put it in `.env.local` as `RESEND_API_KEY=re_...` and restart `npm run dev`
+When you deploy, set **Site URL / Redirect URLs** to your real domain (e.g. `https://your-app.com` and `https://your-app.com/auth/confirm`).
 
-The app then emails codes through **Resend's API (100/day free)** with a branded template — no Supabase dashboard changes. Without the key it falls back to Supabase's built-in email (~2/hour).
+### Email sending: SMTP (recommended) — no domain, no per-hour cap
+The Supabase built-in email provider is capped at **~2 emails/hour for the whole project** — not enough for real signups. The app can instead send through **any SMTP relay** (Brevo, Gmail, SMTP2GO, MailerSend, …), which reaches **any email address with no domain** and no per-hour cap:
 
-Notes:
-- The default sender `onboarding@resend.dev` only delivers to **your own Resend account email** — fine for testing. To send to other people, verify a domain in Resend (free, add DNS records) and set `RESEND_FROM="Vertex <noreply@yourdomain.com>"`.
-- Alternative SMTP providers (dashboard setup): SMTP2GO 200/day · Brevo 300/day.
+1. **Brevo (recommended):** free **300 emails/day**, no credit card. Sign up at **https://brevo.com** → Senders & IPs → verify a sender email (no domain needed) → SMTP & API → copy the **SMTP key**.
+2. Put it in `.env.local` and restart `npm run dev`:
+   ```
+   SMTP_HOST="smtp-relay.brevo.com"
+   SMTP_PORT=587
+   SMTP_SECURE=false
+   SMTP_USER="<your brevo login email>"
+   SMTP_PASS="<your SMTP key>"
+   SMTP_FROM="Vertex <you@example.com>"   # must be a verified sender
+   ```
+   (Gmail alternative: `SMTP_HOST="smtp.gmail.com"`, `SMTP_PORT=465`, `SMTP_SECURE=true`, password = an **app password** from Google → Security → 2-Step Verification → App passwords. ~500 emails/day.)
+
+The branded email includes **both the 6-digit code and a clickable confirmation link** pointing at the app wherever it runs (any port — no Supabase allowlist involved).
+
+Fallbacks if SMTP is not configured or fails: Resend (only when `RESEND_FROM` is set — its default sender only reaches your own account email), then Supabase's built-in email (~2/hour, last resort).
 
 ```powershell
 npm run dev

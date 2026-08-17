@@ -1,11 +1,46 @@
 import { getSupabase } from "./supabase";
-import { sendEmail, buildCodeEmail } from "./email";
+import { sendEmail, sendEmailViaSmtp, buildCodeEmail } from "./email";
 
 export type AuthUser = {
   id: string;
   email: string;
   name: string;
 };
+
+/**
+ * Figure out the app's own base URL, used as redirectTo so the confirmation
+ * link in the emailed code points at the app wherever it's actually running
+ * (any port, any host). Priority: AUTH_REDIRECT_URL env override → the
+ * request's Origin header → Host header. Returns a URL without a trailing
+ * slash, or undefined if nothing usable is found.
+ */
+export function resolveAppUrl(req: Request): string | undefined {
+  const fromEnv = (process.env.AUTH_REDIRECT_URL || "").trim();
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
+
+  const origin = req.headers.get("origin");
+  if (origin && /^https?:\/\/.+/i.test(origin)) {
+    try {
+      const u = new URL(origin);
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        return `${u.protocol}//${u.host}`;
+      }
+    } catch {
+      // fall through to Host
+    }
+  }
+
+  const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
+  if (host) {
+    const proto =
+      req.headers.get("x-forwarded-proto") ||
+      (host.startsWith("localhost") || host.startsWith("127.")
+        ? "http"
+        : "https");
+    return `${proto}://${host}`;
+  }
+  return undefined;
+}
 
 /**
  * The installed supabase-js types don't list `shouldCreateUser` for magiclink
@@ -20,68 +55,202 @@ type GenerateLinkOptionsWithCreate = {
 /**
  * Deliver a verification/reset code to an email address.
  *
- * Primary path (when RESEND_API_KEY is set): generate the code ourselves via
- * the admin API (no Supabase email involved) and send it through Resend
- * (free tier: 100 emails/day). If Resend isn't configured or fails, fall back
- * to Supabase's built-in email (2/hour limit on the free provider).
+ * - Demo accounts (DEMO_OTP_PREFIX): the code is returned in the API response
+ *   instead of emailed — used by the recorded walkthrough videos.
+ * - SMTP path (recommended; SMTP_HOST + SMTP_USER set): the code is generated
+ *   via the admin API and emailed through any SMTP relay (Brevo, Gmail,
+ *   SMTP2GO, …). Works with any provider, no domain needed, no per-hour cap
+ *   (e.g. Brevo free: 300 emails/day to any address). The email includes both
+ *   the code and a clickable confirmation link pointing at the app.
+ * - Resend path (only when RESEND_FROM is set, i.e. a domain is verified):
+ *   the same generated code, sent through Resend (100 emails/day). Skipped
+ *   otherwise, because Resend's default sender (onboarding@resend.dev) can
+ *   only deliver to the account owner's email.
+ * - Fallback: Supabase's built-in email service sends the code. Reaches ANY
+ *   address with no domain or custom sender, but caps at ~2 emails/hour for
+ *   the whole project (free tier) — fine as a last resort, not for real use.
  */
 async function deliverCode(
   email: string,
-  opts: { name?: string; createUser: boolean; kind: "verify" | "reset" }
+  opts: { name?: string; createUser: boolean; kind: "verify" | "reset" },
+  redirectUrl?: string
 ) {
   const sb = getSupabase();
-  const resendKey = process.env.RESEND_API_KEY;
+  let smtpError: string | undefined;
   let resendError: string | undefined;
 
-  if (resendKey) {
+  // Demo mode: when DEMO_OTP_PREFIX is set, codes for matching emails are
+  // returned in the API response instead of emailed — no real email is sent
+  // (no bounce risk for the recorded walkthrough videos).
+  const demoPrefix = (process.env.DEMO_OTP_PREFIX || "").toLowerCase().trim();
+  const isDemo = !!demoPrefix && email.toLowerCase().startsWith(demoPrefix);
+
+  const createOptions = {
+    shouldCreateUser: opts.createUser,
+    data: opts.name ? { name: opts.name } : undefined,
+  } as GenerateLinkOptionsWithCreate;
+
+  // Demo accounts: surface the code on screen instead of emailing it.
+  if (isDemo) {
     try {
       const { data, error } = await sb.auth.admin.generateLink({
         type: "magiclink",
         email,
-        options: {
-          shouldCreateUser: opts.createUser,
-          data: opts.name ? { name: opts.name } : undefined,
-        } as GenerateLinkOptionsWithCreate,
+        options: createOptions,
+      });
+      const otp = data?.properties?.email_otp as string | undefined;
+      if (!error && otp && /^\d{6,8}$/.test(otp)) {
+        return { ok: true as const, codeLength: otp.length, demoCode: otp };
+      }
+    } catch {
+      // fall through to the error below
+    }
+    return {
+      ok: false as const,
+      error: "Could not generate a demo code — check DEMO_OTP_PREFIX in .env.local.",
+    };
+  }
+
+  // Our own senders (SMTP → Resend): generate the OTP once via the admin API
+  // so the email can include BOTH the code and a clickable confirmation link
+  // that points at the app wherever it's running (no Supabase Site URL or
+  // Redirect-URL allowlist involved). SMTP works with any provider (Brevo,
+  // Gmail, SMTP2GO…) with no per-hour cap — the recommended path for letting
+  // everyone sign up. If none of our senders works, we fall back to Supabase's
+  // built-in email below.
+  const smtpConfigured = !!(process.env.SMTP_HOST && process.env.SMTP_USER);
+  const resendConfigured = !!(
+    process.env.RESEND_API_KEY &&
+    process.env.RESEND_FROM
+  );
+  const subject =
+    opts.kind === "reset"
+      ? "Reset your Vertex password"
+      : "Your Vertex verification code";
+
+  if (smtpConfigured || resendConfigured) {
+    let otp: string | undefined;
+    let html: string | undefined;
+    try {
+      const { data, error } = await sb.auth.admin.generateLink({
+        type: "magiclink",
+        email,
+        options: createOptions,
       });
       if (!error) {
-        const otp = data?.properties?.email_otp as string | undefined;
-        if (otp && /^\d{6,8}$/.test(otp)) {
-          const sent = await sendEmail({
-            to: email,
-            subject:
-              opts.kind === "reset"
-                ? "Reset your Vertex password"
-                : "Your Vertex verification code",
-            html: buildCodeEmail(otp, opts.name, opts.kind),
-          });
-          if (sent.ok) return { ok: true as const, codeLength: otp.length };
-          resendError = sent.error;
+        const code = data?.properties?.email_otp as string | undefined;
+        if (code && /^\d{6,8}$/.test(code)) {
+          otp = code;
+          html = buildCodeEmail(
+            code,
+            opts.name,
+            opts.kind,
+            buildConfirmLink(data?.properties?.action_link, redirectUrl)
+          );
         }
       }
     } catch {
-      // Fall through to Supabase's built-in email.
+      // fall through to Supabase's built-in email
+    }
+
+    if (otp && html) {
+      if (smtpConfigured) {
+        const sent = await sendEmailViaSmtp({ to: email, subject, html });
+        if (sent.ok) return { ok: true as const, codeLength: otp.length };
+        smtpError = sent.error;
+      }
+      if (resendConfigured) {
+        const sent = await sendEmail({ to: email, subject, html });
+        if (sent.ok) return { ok: true as const, codeLength: otp.length };
+        resendError = sent.error;
+      }
     }
   }
 
-  // Fallback: let Supabase email it (2/hour on the free built-in provider).
-  const { error } = await sb.auth.signInWithOtp({
-    email,
-    options: {
-      shouldCreateUser: opts.createUser,
-      data: opts.name ? { name: opts.name } : undefined,
-    },
-  });
+  // Default path: Supabase's own email service sends the code — reaches ANY
+  // address with no domain or custom sender (free tier caps at ~2 emails/hour
+  // per address, ~1-minute wait between requests to the same email). When a
+  // redirectUrl is known (the URL the user is actually on), pass it as
+  // redirectTo so the emailed confirmation link points at the app wherever
+  // it's running — any port, any host (the URL must be in the Supabase
+  // Redirect URLs allowlist; if not, we retry without it so the code still
+  // gets emailed).
+  const sendOptions: {
+    shouldCreateUser: boolean;
+    data?: object;
+    redirectTo?: string;
+  } = {
+    shouldCreateUser: opts.createUser,
+    data: opts.name ? { name: opts.name } : undefined,
+  };
+  if (redirectUrl) sendOptions.redirectTo = redirectUrl;
+
+  let { error } = await sb.auth.signInWithOtp({ email, options: sendOptions });
+  if (
+    error &&
+    redirectUrl &&
+    /redirect/i.test(error.message || "") &&
+    /not allowed|invalid|allowlist/i.test(error.message || "")
+  ) {
+    // The redirect URL isn't in the Supabase allowlist — retry without it so
+    // the code still gets emailed (the link will fall back to the Site URL).
+    const { error: retryError } = await sb.auth.signInWithOtp({
+      email,
+      options: {
+        shouldCreateUser: opts.createUser,
+        data: opts.name ? { name: opts.name } : undefined,
+      },
+    });
+    error = retryError;
+  }
   if (error) {
-    // If Resend was configured but failed, that's the more useful signal.
-    if (resendError) {
+    const transient = /rate limit|too many requests|only request this after/i.test(
+      error?.message || ""
+    );
+    if (smtpError) {
+      // SMTP is configured but failed, and Supabase's built-in email couldn't
+      // send either — tell them exactly what to check.
       return {
         ok: false as const,
-        error: `Email sending failed — ${resendError}. Check your RESEND_API_KEY.`,
+        error: `Could not send the code — SMTP failed (${smtpError}) and Supabase's built-in email also failed (${friendly(error)}). Check SMTP_HOST / SMTP_USER / SMTP_PASS in .env.local.`,
+      };
+    }
+    if (resendError && !transient) {
+      // Resend is configured but failed for a real reason, and Supabase's
+      // built-in email couldn't send either — tell them what to check.
+      return {
+        ok: false as const,
+        error: `Could not send the code: ${friendly(error)} Resend is configured but failed (${resendError}) — check RESEND_API_KEY and RESEND_FROM in .env.local.`,
       };
     }
     return { ok: false as const, error: friendly(error) };
   }
   return { ok: true as const, codeLength: await probeCodeLength(email) };
+}
+
+/**
+ * Build an app-hosted confirmation link from the magic-link token Supabase
+ * generates — so our branded emails can include a clickable link that points
+ * at the app on whatever host/port it runs (no Supabase Site URL or Redirect
+ * URLs allowlist involved).
+ */
+function buildConfirmLink(
+  actionLink: string | undefined,
+  appUrl: string | undefined
+): string | undefined {
+  if (!appUrl || !actionLink) return undefined;
+  try {
+    const u = new URL(actionLink);
+    const token =
+      u.searchParams.get("token") || u.searchParams.get("token_hash") || "";
+    const type = u.searchParams.get("type") || "email";
+    if (!token) return undefined;
+    return `${appUrl}/auth/confirm?token_hash=${encodeURIComponent(
+      token
+    )}&type=${encodeURIComponent(type)}`;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -111,9 +280,18 @@ async function probeCodeLength(email: string): Promise<number> {
   return codeLength;
 }
 
-export async function sendOtpCode(email: string, name?: string) {
+export async function sendOtpCode(
+  email: string,
+  name?: string,
+  redirectUrl?: string
+) {
   try {
     const sb = getSupabase();
+
+    // Demo accounts may already exist from earlier runs — let demo codes
+    // through so the recorded walkthrough can re-verify them.
+    const demoPrefix = (process.env.DEMO_OTP_PREFIX || "").toLowerCase().trim();
+    const isDemo = demoPrefix && email.toLowerCase().startsWith(demoPrefix);
 
     // If the account already exists and is confirmed, tell them to sign in.
     try {
@@ -121,7 +299,7 @@ export async function sendOtpCode(email: string, name?: string) {
       const existing = data?.users?.find(
         (u) => u.email?.toLowerCase() === email.toLowerCase()
       );
-      if (existing && (existing.confirmed_at || existing.email_confirmed_at)) {
+      if (existing && (existing.confirmed_at || existing.email_confirmed_at) && !isDemo) {
         return {
           ok: false as const,
           error: "An account with this email already exists — sign in instead.",
@@ -131,11 +309,15 @@ export async function sendOtpCode(email: string, name?: string) {
       // List may be unavailable — proceed and let generateLink decide.
     }
 
-    return await deliverCode(email, {
-      name,
-      createUser: true,
-      kind: "verify",
-    });
+    return await deliverCode(
+      email,
+      {
+        name,
+        createUser: true,
+        kind: "verify",
+      },
+      redirectUrl
+    );
   } catch {
     return { ok: false as const, error: "Could not reach the auth service." };
   }
@@ -156,6 +338,8 @@ export async function verifyOtpCode(email: string, code: string) {
     return {
       ok: true as const,
       user: toAuthUser(data.user),
+      token: data.session?.access_token ?? null,
+      refreshToken: data.session?.refresh_token ?? null,
     };
   } catch {
     return { ok: false as const, error: "Could not reach the auth service." };
@@ -166,9 +350,13 @@ export async function verifyOtpCode(email: string, code: string) {
  * Send a password-reset code to an existing account's email (Supabase OTP).
  * Fails cleanly if no account has that email.
  */
-export async function sendResetCode(email: string) {
+export async function sendResetCode(email: string, redirectUrl?: string) {
   try {
-    return await deliverCode(email, { createUser: false, kind: "reset" });
+    return await deliverCode(
+      email,
+      { createUser: false, kind: "reset" },
+      redirectUrl
+    );
   } catch {
     return { ok: false as const, error: "Could not reach the auth service." };
   }
@@ -221,6 +409,8 @@ export async function verifyLink(
     return {
       ok: true as const,
       user: toAuthUser(data.user),
+      token: data.session?.access_token ?? null,
+      refreshToken: data.session?.refresh_token ?? null,
     };
   } catch {
     return { ok: false as const, error: "Could not reach the auth service." };
@@ -241,9 +431,54 @@ export async function loginWithPassword(email: string, password: string) {
     return {
       ok: true as const,
       user: toAuthUser(data.user),
+      token: data.session?.access_token ?? null,
+      refreshToken: data.session?.refresh_token ?? null,
     };
   } catch {
     return { ok: false as const, error: "Could not reach the auth service." };
+  }
+}
+
+/**
+ * Exchange a refresh token for a fresh session (silent renewal). Called
+ * before the access token expires (proactive timer) or on a 401 (retry once
+ * before giving up). Returns the new access + refresh token pair.
+ */
+export async function refreshSessionToken(refreshToken: string) {
+  try {
+    const sb = getSupabase();
+    const { data, error } = await sb.auth.refreshSession({
+      refresh_token: refreshToken,
+    });
+    if (error || !data.session?.access_token || !data.user?.email) {
+      return { ok: false as const, error: friendly(error) };
+    }
+    return {
+      ok: true as const,
+      user: toAuthUser(data.user),
+      token: data.session.access_token,
+      refreshToken: data.session.refresh_token ?? null,
+    };
+  } catch {
+    return { ok: false as const, error: "Could not reach the auth service." };
+  }
+}
+
+/**
+ * Validate the Bearer token sent with protected API calls (/api/chat,
+ * /api/upload). Returns the auth'd user or null (401).
+ */
+export async function requireUser(req: Request): Promise<AuthUser | null> {
+  const header = req.headers.get("authorization") || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) return null;
+  try {
+    const sb = getSupabase();
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data.user?.email) return null;
+    return toAuthUser(data.user);
+  } catch {
+    return null;
   }
 }
 
@@ -273,9 +508,9 @@ function friendly(error: { message?: string } | null | undefined): string {
   if (/already registered|user already/i.test(m))
     return "An account with this email already exists. Sign in instead.";
   if (/rate limit|too many requests|over_email_send_rate_limit/i.test(m))
-    return "Too many verification emails — the free Supabase email service allows about 2 per hour. Add a free Resend API key (RESEND_API_KEY in .env.local) for 100 emails/day, then try again.";
+    return "Too many verification emails — the free Supabase email service allows about 2 per hour per address, so wait an hour and try again.";
   if (/only request this after (\d+) second/i.test(m))
-    return "Please wait a moment before requesting another code.";
+    return "Supabase limits code requests to about one per minute per email — wait a moment, then request another code.";
   if (/invalid otp|token has expired|invalid token/i.test(m))
     return "That code is invalid or expired. Request a new one.";
   if (/max otp attempts/i.test(m))

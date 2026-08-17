@@ -1,0 +1,6 @@
+{
+  "welcome": "Welcome to Vertex, your document-aware AI assistant. I've uploaded the PEHAM student handbook, and now I'll show you how Vertex answers questions with cited sources.",
+  "answer": "I asked: when are office hours? Vertex pulled the answer straight from the handbook and cited the exact source chunks it used, so every claim can be verified.",
+  "citation": "Clicking any citation jumps you to the source snippet in the document, so you can check the answer against the original text in one click.",
+  "weather": "Vertex also has built-in tool calling. When I ask about the weather in Islamabad, it calls the Open-Meteo API live and returns a real forecast — not a made-up one."
+}

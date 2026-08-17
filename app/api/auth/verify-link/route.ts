@@ -23,5 +23,10 @@ export async function POST(req: Request) {
   if (!result.ok) {
     return NextResponse.json({ error: result.error }, { status: 400 });
   }
-  return NextResponse.json({ ok: true, user: result.user });
+  return NextResponse.json({
+    ok: true,
+    user: result.user,
+    token: result.token,
+    refreshToken: result.refreshToken,
+  });
 }

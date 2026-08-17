@@ -47,8 +47,9 @@ docker run -p 3000:3000 --env-file .env.local vertex-next
   under `.next/standalone/ai-internship/vertex-next/` (node-file-trace path
   quirk); the Docker build runs on Linux where the layout is the standard flat
   `.next/standalone/server.js`.
-- Next deploy step (Week 5): push repo → create app in **Coolify** → set env
-  vars → build & deploy.
+- Next deploy step (Week 5): full click-by-click runbook in **`DEPLOYMENT.md`** — Oracle
+  Cloud free tier (Always Free ARM) → Coolify → Dockerfile build → env vars → live URL
+  (fallback: Vercel, documented there too).
 
 ## Env
 Same as before, plus optional:

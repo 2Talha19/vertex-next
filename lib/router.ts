@@ -24,12 +24,15 @@ export function routeMessage(
   opts: {
     availableSources?: string[];
     preferredSource?: string | null;
+    /** True when the user has ANY uploaded documents in their account. */
+    hasDocs?: boolean;
   } = {}
 ): RouteDecision {
   const text = message.trim();
   const lower = text.toLowerCase();
   const available = opts.availableSources ?? [];
   const preferred = opts.preferredSource ?? null;
+  const hasDocs = opts.hasDocs ?? false;
 
   // --- Weather specialist ---
   if (/\b(weather|temperature|forecast|humid|°c|°f)\b/i.test(text)) {
@@ -114,6 +117,16 @@ export function routeMessage(
     return {
       route: "docs",
       reason: "active document + substantive question",
+      label: "Docs agent",
+    };
+  }
+
+  // The user has uploads → treat any substantive question as a docs question
+  // so their OWN files get searched even without doc keywords.
+  if (hasDocs && (text.includes("?") || text.length > 25)) {
+    return {
+      route: "docs",
+      reason: "user has documents; any question may be about them",
       label: "Docs agent",
     };
   }
