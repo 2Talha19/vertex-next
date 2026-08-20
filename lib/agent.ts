@@ -64,11 +64,74 @@ type CitationRow = {
   content: string;
 };
 
+type CompletionResponse = OpenAI.Chat.Completions.ChatCompletion;
+
+// ===================== GEMINI PROVIDER =====================
+// Raw fetch — no SDK needed. Used as automatic fallback when Groq hits
+// its daily token limit (100 K tokens/day on free tier).
+async function callGemini(params: {
+  messages: ChatCompletionMessageParam[];
+  max_tokens: number;
+}): Promise<CompletionResponse> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY not set");
+  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
+  // Map OpenAI messages → Gemini format
+  let systemText = "";
+  const contents: { role: "user" | "model"; parts: { text: string }[] }[] = [];
+  for (const msg of params.messages) {
+    if (msg.role === "system") {
+      systemText = typeof msg.content === "string" ? msg.content : "";
+    } else {
+      const text = typeof msg.content === "string" ? msg.content : "";
+      if (!text) continue;
+      const geminiRole = msg.role === "assistant" ? "model" : "user";
+      // Merge consecutive same-role messages (Gemini requires alternation)
+      const last = contents[contents.length - 1];
+      if (last && last.role === geminiRole) {
+        last.parts[0].text += "\n" + text;
+      } else {
+        contents.push({ role: geminiRole, parts: [{ text }] });
+      }
+    }
+  }
+
+  const body: Record<string, unknown> = { contents };
+  if (systemText) body.systemInstruction = { parts: [{ text: systemText }] };
+  body.generationConfig = { maxOutputTokens: params.max_tokens };
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => "");
+    throw new Error(`Gemini ${res.status}: ${errBody.slice(0, 200)}`);
+  }
+  const data = (await res.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+  return {
+    choices: [
+      {
+        message: { content: text, role: "assistant" as const, refusal: null },
+        index: 0,
+        finish_reason: "stop",
+      },
+    ],
+  } as CompletionResponse;
+}
+
 /**
  * Call the model with automatic retry on transient failures.
  * - 429 (rate limit / TPM exceeded): waits ~2s then retries, up to `attempts`
- *   total, honoring a Retry-After header when the API sends one. Long chats
- *   hit Groq's free-tier TPM cap often; this makes them invisible to the user.
+ *   total, honoring a Retry-After header when the API sends one.
  * - 5xx / network blips: also retried (brief, usually self-healing).
  * - 4xx auth/validation errors are NOT retried — they'd never succeed.
  */
@@ -104,6 +167,35 @@ async function chatWithRetry(
   throw lastErr;
 }
 
+// ===================== FALLBACK DISPATCHER =====================
+// Tries Groq first (fast, cheap). On a 429 that can't be waited out
+// (daily TPD limit), automatically switches to Gemini.
+async function chatWithFallback(
+  client: OpenAI,
+  model: string,
+  messages: ChatCompletionMessageParam[],
+  max_tokens: number
+): Promise<CompletionResponse> {
+  try {
+    return await chatWithRetry(client, { model, messages, max_tokens });
+  } catch (groqErr) {
+    const status = (groqErr as { status?: number }).status ?? 0;
+    const msg = (groqErr as Error).message || "";
+    const isBlocked =
+      status === 429 &&
+      (/per day|TPD|daily|try again in \d+m/i.test(msg) ||
+        Number((groqErr as { headers?: Headers }).headers?.get?.("retry-after") ?? 0) > 60);
+    if (isBlocked && process.env.GEMINI_API_KEY) {
+      try {
+        return await callGemini({ messages, max_tokens });
+      } catch {
+        // Gemini also failed — throw the original Groq error
+      }
+    }
+    throw groqErr;
+  }
+}
+
 async function* streamAnswer(
   client: OpenAI,
   model: string,
@@ -119,18 +211,14 @@ async function* streamAnswer(
   // city as JSON, fetch the weather, then ask it to answer.
   if (useWeatherTool) {
     const userMessages = messages.filter((m) => m.role !== "system");
-    const extract = await chatWithRetry(client, {
-      model,
-      messages: [
+    const extract = await chatWithFallback(client, model, [
         {
           role: "system",
           content:
             "Extract the city the user is asking about the weather for. Reply with ONLY a JSON object in this exact form: {\"city\": \"CityName\"}. No other text.",
         },
         ...userMessages,
-      ],
-      max_tokens: 60,
-    });
+      ], 60);
     const raw = extract.choices[0]?.message?.content?.trim() ?? "";
     let city: string | null = null;
     try {
@@ -158,9 +246,7 @@ async function* streamAnswer(
       weather = JSON.stringify({ error: (e as Error).message });
     }
 
-    const final = await chatWithRetry(client, {
-      model,
-      messages: [
+    const final = await chatWithFallback(client, model, [
         {
           role: "system",
           content:
@@ -175,9 +261,7 @@ async function* streamAnswer(
           role: "user",
           content: "Now answer my weather question based on that data.",
         },
-      ],
-      max_tokens: 400,
-    });
+      ], 400);
     const answer = final.choices[0]?.message?.content?.trim() ?? "";
     for (const w of answer.split(/(\s+)/)) {
       if (w) yield { type: "token", text: w };
@@ -191,13 +275,11 @@ async function* streamAnswer(
   for (let round = 1; round <= 4; round++) {
     let msg;
     try {
-      const res = await chatWithRetry(client, {
-        model,
-        messages: working,
+      const res = await chatWithFallback(client, model, working,
         // Cap output so answers stay short and cheap.
         // 400 tokens ≈ 280–320 words — enough for a full, cited answer.
-        max_tokens: 400,
-      });
+        400,
+      );
       msg = res.choices[0]?.message;
     } catch (err) {
       yield {
