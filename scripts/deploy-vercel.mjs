@@ -84,6 +84,7 @@ async function main() {
   const have = new Set((existing.envs || []).map((e) => e.key));
   for (const key of ENV_VARS_TO_SET) {
     if (!(key in local)) continue;
+    if (have.has(key)) continue; // already set, skip
     const targets = ['production', 'preview', 'development'];
     await api(token, `/v10/projects/${projectId}/env?${qs}`, {
       method: 'POST',
