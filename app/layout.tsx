@@ -1,8 +1,12 @@
 import "./globals.css";
+import type { Metadata } from "next";
 
-export const metadata = {
-  title: "Ask Peham's Docs — Vertex",
-  description: "Internal docs assistant: RAG, OCR, citations, streaming",
+export const metadata: Metadata = {
+  title: "Vertex",
+  description: "Vertex — Ask Peham's Docs",
+  icons: {
+    icon: "/logo.png",
+  },
 };
 
 export default function RootLayout({
